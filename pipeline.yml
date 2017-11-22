@@ -1,0 +1,121 @@
+resources:
+- name: java-buildpack
+  type: github-release
+  source:
+    owner: cloudfoundry
+    repository: java-buildpack
+
+- name: rootfs
+  type: docker-image
+  source:
+    repository: cloudfoundry/cflinuxfs2
+
+- name: spring-music
+  type: git
+  source:
+    uri: https://github.com/sclevine/spring-music
+    branch: master
+
+- name: droplet
+  type: s3
+  source:
+    bucket: sclevine
+    regexp: spring-music/spring-music-(.*).droplet
+    region_name: us-east-2
+    access_key_id: {{s3-access-key-id}}
+    secret_access_key: {{s3-secret-access-key}}
+
+- name: cache
+  type: s3
+  source:
+    bucket: sclevine
+    regexp: spring-music/spring-music-(.*).cache
+    region_name: us-east-2
+    access_key_id: {{s3-access-key-id}}
+    secret_access_key: {{s3-secret-access-key}}
+
+- name: app-image
+  type: docker-image
+  source:
+    repository: sclevine/spring-music
+    username: {{registry-username}}
+    password: {{registry-password}}
+
+jobs:
+- name: build-droplet
+  plan:
+  - aggregate:
+    - get: spring-music
+      trigger: true
+    - get: java-buildpack
+      trigger: true
+      params:
+        globs: [java-buildpack-v*.zip]
+    - get: cache
+  - task: build-droplet
+    privileged: true
+    config:
+      platform: linux
+      image_resource:
+        type: docker-image
+        source: {repository: sclevine/mark-ci, tag: latest}
+      inputs:
+      - name: spring-music
+      - name: java-buildpack
+      - name: cache
+      outputs:
+      - name: droplet
+      - name: cache-out
+      run:
+        path: sh
+        args:
+        - -exc
+        - |
+          source /docker-lib.sh && start_docker
+          cd spring-music
+          ./gradlew clean assemble
+          mv ../cache/*.cache .spring-music.cache
+          [[ -s .spring-music.cache ]] || rm .spring-music.cache
+          cf local stage spring-music -p build/libs/spring-music.jar -b ../java-buildpack/java-buildpack-v*.zip
+          mv spring-music.droplet ../droplet/spring-music-0.0.$(git rev-list --count HEAD)+$(git rev-parse --short HEAD).droplet
+          mv .spring-music.cache ../cache-out/spring-music-0.0.$(git rev-list --count HEAD)+$(git rev-parse --short HEAD).cache
+  - aggregate:
+    - put: droplet
+      params:
+        file: droplet/spring-music-*.droplet
+    - put: cache
+      params:
+        file: cache-out/spring-music-*.cache
+
+- name: build-image
+  plan:
+  - aggregate:
+    - get: droplet
+      trigger: true
+      passed: [build-droplet]
+    - get: rootfs
+      trigger: true
+  - task: build-image
+    privileged: true
+    config:
+      platform: linux
+      image_resource:
+        type: docker-image
+        source: {repository: sclevine/mark-ci, tag: latest}
+      inputs:
+      - name: droplet
+      outputs:
+      - name: image
+      run:
+        path: sh
+        args:
+        - -exc
+        - |
+          source /docker-lib.sh && start_docker
+          cp droplet/*.droplet app.droplet
+          cf local export app -r sclevine/spring-music
+          docker save -o image/image sclevine/spring-music
+          docker inspect -f '{{.Id}}' sclevine/spring-music > image/image-id
+  - put: app-image
+    params:
+      load: image
